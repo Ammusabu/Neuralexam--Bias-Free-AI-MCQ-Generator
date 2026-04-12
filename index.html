@@ -792,6 +792,7 @@ function navTo(s) {
 
 /* ══ GENERATE ══ */
 async function gen() {
+  console.log("GEN FUNCTION TRIGGERED");
   const btn = document.getElementById('gbtn');
   const num  = parseInt(document.getElementById('cfg-n').value);
   const diff = document.getElementById('cfg-d').value;
@@ -1064,12 +1065,18 @@ function toast(msg, type = 'info') {
 }
 
 // attach button click AFTER page loads
-document.addEventListener("DOMContentLoaded", () => {
+window.onload = function () {
+  console.log("Page Loaded");
+
   const btn = document.getElementById("gbtn");
-  if (btn) {
-    btn.addEventListener("click", gen);
+
+  if (!btn) {
+    console.log("Button NOT FOUND ❌");
+  } else {
+    console.log("Button Found ✅");
+    btn.onclick = gen;
   }
-});
+};
 </script>
 </body>
 </html>
