@@ -383,7 +383,7 @@ textarea.finp{resize:vertical;min-height:180px;line-height:1.65}
       <div class="sb-bottom">
         <div class="sysinfo">
           MODEL: <span>llama-3.1-8b</span><br/>
-          API: <span>localhost:8000</span><br/>
+          API: <span>neuralexam-api.onrender.com</span><br/>
           BIAS: <span>BALANCED</span><br/>
           
         </div>
@@ -728,7 +728,7 @@ frame();
    APP STATE
    ══════════════════════════════ */
 let mode = 'exam', tab = 'topic', sid = null, mcqs = [], ua = {};
-const API = 'https://neuralexam-api.onrender.com/';
+const API = 'https://neuralexam-api.onrender.com';
 const L = ['A', 'B', 'C', 'D'];
 
 /* ══ SYNC SUMMARY ══ */
@@ -840,7 +840,7 @@ async function gen() {
     buildGrid(); renderQuiz(); navTo('quiz');
     toast(mcqs.length + ' questions ready!', 'ok');
   } catch(e) {
-    toast('Cannot reach server. Is FastAPI running?', 'err');
+    toast('Cannot reach API server. Check network or API URL.', 'err');
   } finally {
     btn.classList.remove('ld'); btn.disabled = false;
   }
