@@ -11,6 +11,7 @@ Unlike typical quiz generators, NeuralExam ensures that answer distributions are
 👉 https://neuralexam.netlify.app
 
 ---
+<img width="2880" height="1800" alt="image" src="https://github.com/user-attachments/assets/d5a097f5-3e82-433d-93ae-a78e197bbdaf" />
 
 ## 🧠 Key Features
 
@@ -101,8 +102,6 @@ NeuralExam solves this by:
 
 ## 📸 Screenshots
 
-<img width="2880" height="1800" alt="image" src="https://github.com/user-attachments/assets/d5a097f5-3e82-433d-93ae-a78e197bbdaf" />
-
 <img width="2880" height="1800" alt="image" src="https://github.com/user-attachments/assets/29a77d96-c469-4f04-a703-ce71c35f3ac7" />
 
 <img width="2880" height="1800" alt="image" src="https://github.com/user-attachments/assets/8ed03c72-da2a-4c3c-8c84-bfc40c4aced2" />
@@ -121,7 +120,8 @@ NeuralExam solves this by:
 ## 👨‍💻 Author
 
 **Ammu.s**
-Built with passion for AI + fair assessment systems 🚀
+
+-Built with passion for AI + fair assessment systems 🚀-
 
 ---
 
