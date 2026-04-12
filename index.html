@@ -442,7 +442,7 @@ textarea.finp{resize:vertical;min-height:180px;line-height:1.65}
             <div class="sum-card"><div class="sum-key">Mode</div><div class="sum-val" id="s-m" style="color:var(--rose)">Exam</div></div>
           </div>
 
-          <button class="gbtn" id="gbtn" onclick="gen()">
+          <button class="gbtn" id="gbtn">
             <span class="bt">⚡ Generate Assessment</span>
             <div class="sp"></div>
           </button>
@@ -1062,6 +1062,14 @@ function toast(msg, type = 'info') {
   clearTimeout(tt);
   tt = setTimeout(() => el.classList.remove('on'), 3500);
 }
+
+// attach button click AFTER page loads
+document.addEventListener("DOMContentLoaded", () => {
+  const btn = document.getElementById("gbtn");
+  if (btn) {
+    btn.addEventListener("click", gen);
+  }
+});
 </script>
 </body>
 </html>
