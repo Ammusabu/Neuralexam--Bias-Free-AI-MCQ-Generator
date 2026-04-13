@@ -9,8 +9,7 @@ import os
 import json
 import random
 import uuid
-from PyPDF2 import PdfReader
-
+import pdfplumber
 # =========================
 # 2. LOAD ENV
 # =========================
@@ -48,12 +47,14 @@ class SubmitRequest(BaseModel):
 # =========================
 
 # 📄 Extract PDF text
-def extract_text_from_pdf(file_path: str) -> str:
-    reader = PdfReader(file_path)
+def extract_text_from_pdf(file_path):
     text = ""
-    for page in reader.pages:
-        text += page.extract_text() or ""
-    return text
+    with pdfplumber.open(file_path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text += t + " "
+    return re.sub(r'\s+', ' ', text)
 import re
 
 def safe_json_parse(raw_response: str):
@@ -89,30 +90,42 @@ def safe_json_parse(raw_response: str):
 
 # 🧠 Generate MCQs using Groq LLM
 def generate_mcqs_from_llm(content: str, num_questions: int, difficulty: str) -> list:
-    prompt = prompt = f"""
-Generate {num_questions} {difficulty} multiple-choice questions based on the following topic:
+    prompt = f"""
+Generate {num_questions} {difficulty} level MCQs from the following content:
 
 {content}
 
-Return ONLY a valid JSON array. Do not include any explanation outside JSON.
+🎯 REQUIREMENTS:
+- Questions must NOT be repetitive or similar
+- Avoid basic definitions for all questions
+- Include a mix of:
+  • conceptual questions
+  • application-based questions
+  • tricky questions
+  • real-world scenarios (if possible)
 
-Format:
+- Ensure variety across topics
+- Each question must test understanding, not memorization
+
+📌 OPTIONS RULES:
+- 4 options only
+- All options should be similar in length
+- Avoid obvious correct answers
+- Distractors must be realistic
+
+📌 ANSWER RULE:
+- Correct answer must NOT always be obvious
+- Avoid patterns like always "A" or short answer
+
+📌 OUTPUT FORMAT (STRICT JSON ONLY):
 [
   {{
-    "question": "Question text",
-    "options": ["Option A", "Option B", "Option C", "Option D"],
+    "question": "...",
+    "options": ["...", "...", "...", "..."],
     "answer": "A",
-    "explanation": "Short explanation"
+    "explanation": "Clear explanation why correct"
   }}
 ]
-
-Rules:
-- Each question must have exactly 4 options
-- "answer" must be one of: A, B, C, or D
-- Do NOT include labels like A), B) inside options
-- Keep explanations short and clear
-- Avoid special characters and unnecessary symbols
-- Ensure valid JSON (no trailing commas, properly closed brackets)
 """
 
     for attempt in range(3):
@@ -299,12 +312,29 @@ async def generate_mcq(
             return {"error": "Extracted content is empty. Please provide valid input."}
 
         # Limit content size to avoid LLM token overflow
-        content = content[:3000]
+        def split_text(text, chunk_size=1000):
+            return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
         # --- Generate & Process MCQs ---
-        mcqs = generate_mcqs_from_llm(content, num_questions, difficulty.lower())
-        if not mcqs:
-            return {"error": "AI failed to generate valid MCQs. Try again or simplify input."}
+        # 🔥 Split large content into chunks
+        chunks = split_text(content, 1000)
+        all_mcqs = []
+
+# decide how many questions per chun
+        per_chunk = max(2, num_questions // min(len(chunks), 5))
+
+# limit chunks (avoid too many API calls)
+        chunks = chunks[:5]
+
+        for chunk in chunks:
+            part = generate_mcqs_from_llm(chunk, per_chunk, difficulty.lower())
+            if part:
+                all_mcqs.extend(part)
+
+# final trim to requested number
+        mcqs = all_mcqs[:num_questions]
+        if not mcqs or len(mcqs) < 3:
+            return {"error": "AI failed to generate enough MCQs. Try smaller input."}
 
         mcqs = [
     q for q in mcqs

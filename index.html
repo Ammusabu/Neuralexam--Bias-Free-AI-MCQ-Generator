@@ -34,12 +34,30 @@
   --hh:       64px;
 }
 
-html,body{height:100%;overflow:hidden}
-body{font-family:var(--sans);background:var(--bg);color:var(--text);display:flex;flex-direction:column}
+html,body{
+  height:100%;
+  overflow-x:hidden;
+  overflow-y:auto;
+}
+
+body{
+  overscroll-behavior: contain;
+  font-family:var(--sans);
+  background:var(--bg);
+  color:var(--text);
+  display:flex;
+  flex-direction:column;
+}
 
 #bg{position:fixed;inset:0;z-index:0;pointer-events:none}
 
-.shell{position:relative;z-index:1;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.shell{
+  position:relative;
+  z-index:1;
+  display:flex;
+  flex-direction:column;
+  min-height:100vh;
+}
 
 /* TOPBAR */
 .topbar{
@@ -59,7 +77,9 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);display:flex
   border-radius:7px;padding:5px 13px;font-family:var(--mono);font-size:11px;color:var(--text3);letter-spacing:.06em}
 .tb-dot{width:7px;height:7px;border-radius:50%;background:var(--emerald);box-shadow:0 0 8px var(--emerald);animation:blink 2s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-
+.opt:active {
+  transform: scale(0.97);
+}
 /* BODY */
 .body-row{display:flex;flex:1;overflow:hidden}
 
@@ -308,7 +328,8 @@ textarea.finp{resize:vertical;min-height:180px;line-height:1.65}
 .toast.ok{border-color:rgba(16,185,129,.35)}
 
 .footer {
-  margin-top: 200px;   /* increase this */
+  margin-top: auto;
+  padding: 12px;
   font-size: 12px;
   color: #6b7280;
   text-align: center;
@@ -318,6 +339,40 @@ textarea.finp{resize:vertical;min-height:180px;line-height:1.65}
   color: #bbc7dd;
   margin-top: 2px;
   letter-spacing: 0.5px;
+}
+@media (max-width: 768px) {
+
+.body-row {
+  flex-direction: column;
+}
+
+.sidebar {
+  width: 100%;
+  border-right: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.rpanel {
+  display: none;
+}
+
+.main {
+  width: 100%;
+}
+
+.r3, .r2 {
+  grid-template-columns: 1fr;
+}
+
+.ch {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.gbtn, .sbtn {
+  width: 100%;
+}
+
 }
 </style>
 </head>
@@ -792,7 +847,6 @@ function navTo(s) {
 
 /* ══ GENERATE ══ */
 async function gen() {
-  console.log("GEN FUNCTION TRIGGERED");
   const btn = document.getElementById('gbtn');
   const num  = parseInt(document.getElementById('cfg-n').value);
   const diff = document.getElementById('cfg-d').value;
@@ -820,10 +874,22 @@ async function gen() {
   btn.classList.add('ld'); btn.disabled = true;
   try {
     const res  = await fetch(`${API}/generate-mcq`, { method: 'POST', body: fd });
+    if (!res.ok) {
+      toast("Server error", "err");
+      return;
+    }
     const data = await res.json();
     if (data.error) { toast(data.error, 'err'); return; }
 
-    sid = data.session_id; mcqs = data.mcqs; ua = {};
+    mcqs = data.mcqs;
+
+// ✅ ADD THIS CHECK HERE
+    if (!mcqs || !mcqs.length) {
+      toast("No questions generated", "err");
+      return;
+}
+
+    sid = data.session_id; ua = {};
     document.getElementById('sid-pill').textContent = 'SID: ' + sid.substring(0, 8).toUpperCase();
     document.getElementById('rp-q').textContent = mcqs.length;
     document.getElementById('rp-m').textContent = mode.toUpperCase();
@@ -1064,7 +1130,6 @@ function toast(msg, type = 'info') {
   tt = setTimeout(() => el.classList.remove('on'), 3500);
 }
 
-// attach button click AFTER page loads
 
 </script>
 </body>
