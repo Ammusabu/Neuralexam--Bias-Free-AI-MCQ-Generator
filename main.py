@@ -1,41 +1,104 @@
 # =========================
-# 1. IMPORTS
+# 1. IMPORTS (all at top)
 # =========================
-from fastapi import FastAPI, Form, UploadFile, File
-from pydantic import BaseModel
-from groq import Groq
-from dotenv import load_dotenv
+import re
 import os
 import json
 import random
 import uuid
+import logging
+import time
+from contextlib import asynccontextmanager
+
 import pdfplumber
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from groq import Groq
+from dotenv import load_dotenv
+
 # =========================
-# 2. LOAD ENV
+# 2. LOGGING SETUP
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# =========================
+# 3. LOAD ENV
 # =========================
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is not set in environment variables.")
 
 client = Groq(api_key=GROQ_API_KEY)
 
 # =========================
-# 3. INIT APP
+# 4. CONSTANTS
+# =========================
+VALID_DIFFICULTIES   = {"easy", "medium", "hard"}
+VALID_MODES          = {"exam", "practice"}
+MAX_QUESTIONS        = 50
+MIN_QUESTIONS        = 1
+CHUNK_SIZE           = 4000        # chars per chunk (≈600 tokens — enough context)
+MAX_CHUNKS           = 5           # max Groq API calls per request
+SESSION_TTL_SECONDS  = 3600        # 1 hour session expiry
+TEMP_DIR             = "/tmp"      # safe temp directory
+
+# =========================
+# 5. SESSION STORE
+# =========================
+# Each entry: { "mcqs": [...], "created_at": float }
+stored_sessions: dict[str, dict] = {}
+
+
+def purge_expired_sessions() -> None:
+    """Remove sessions older than SESSION_TTL_SECONDS."""
+    now = time.time()
+    expired = [
+        sid for sid, data in stored_sessions.items()
+        if now - data["created_at"] > SESSION_TTL_SECONDS
+    ]
+    for sid in expired:
+        del stored_sessions[sid]
+        logger.info(f"Purged expired session: {sid}")
+
+
+# =========================
+# 6. LIFESPAN (replaces deprecated @app.on_event)
+# =========================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("NeuralExam MCQ API starting up.")
+    yield
+    logger.info("NeuralExam MCQ API shutting down.")
+
+
+# =========================
+# 7. INIT APP  (CORS added BEFORE routes)
 # =========================
 app = FastAPI(
-    title="Bias-Free MCQ Assessment System",
+    title="NeuralExam — Bias-Free MCQ Assessment System",
     description="AI-powered MCQ generator with fairness and bias correction.",
-    version="1.0.0"
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
-# Session-based storage (replaces unsafe global list)
-stored_sessions: dict[str, list] = {}
-
-# Valid difficulty levels
-VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+# CORS must be added before any route registration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # tighten to your domain in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # =========================
-# 4. PYDANTIC MODELS
+# 8. PYDANTIC MODELS
 # =========================
 class SubmitRequest(BaseModel):
     session_id: str
@@ -43,413 +106,466 @@ class SubmitRequest(BaseModel):
 
 
 # =========================
-# 5. HELPER FUNCTIONS
+# 9. HELPER — PDF EXTRACTION
 # =========================
-
-# 📄 Extract PDF text
-def extract_text_from_pdf(file_path):
-    text = ""
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extract and clean text from a PDF file."""
+    text_parts = []
     with pdfplumber.open(file_path) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t:
-                text += t + " "
-    return re.sub(r'\s+', ' ', text)
-import re
+                text_parts.append(t)
+    raw = " ".join(text_parts)
+    return re.sub(r"\s+", " ", raw).strip()
 
-def safe_json_parse(raw_response: str):
-    import re
-    import json
 
-    # Remove markdown
-    raw_response = raw_response.replace("```json", "").replace("```", "").strip()
+# =========================
+# 10. HELPER — SAFE JSON PARSE
+# =========================
+def safe_json_parse(raw: str) -> list:
+    """
+    Robustly extract a JSON array from LLM output.
+    Handles markdown fences, trailing commas, stray control chars.
+    """
+    # Strip markdown fences
+    raw = re.sub(r"```json\s*", "", raw)
+    raw = re.sub(r"```\s*", "", raw)
+    raw = raw.strip()
 
-    # Extract JSON array
-    match = re.search(r"\[.*\]", raw_response, re.DOTALL)
+    # Find outermost JSON array
+    start = raw.find("[")
+    end   = raw.rfind("]") + 1
+    if start == -1 or end == 0:
+        raise ValueError("No JSON array found in LLM response.")
+
+    raw = raw[start:end]
+
+    # Fix trailing commas before } or ]
+    raw = re.sub(r",\s*}", "}", raw)
+    raw = re.sub(r",\s*]", "]", raw)
+
+    # Remove control characters (except tab/newline used in JSON)
+    raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", raw)
+
+    # Collapse newlines inside string values to spaces
+    raw = re.sub(r'(?<=")(\n)(?=[^"]*")', " ", raw)
+
+    return json.loads(raw)
+
+
+# =========================
+# 11. HELPER — NORMALIZE ANSWER KEY
+# =========================
+def normalize_answer_key(raw_answer: str) -> str:
+    """
+    Convert LLM answer variants like 'A.', 'Option A', '(A)', 'a' → 'A'.
+    Raises ValueError if no valid A–D key found.
+    """
+    if not raw_answer:
+        raise ValueError("Empty answer key.")
+    match = re.search(r"\b([A-Da-d])\b", raw_answer)
     if not match:
-        raise ValueError("No valid JSON found.")
+        raise ValueError(f"Cannot parse answer key from: '{raw_answer}'")
+    return match.group(1).upper()
 
-    cleaned = match.group(0)
 
-    # Fix trailing commas
-    cleaned = re.sub(r",\s*}", "}", cleaned)
-    cleaned = re.sub(r",\s*]", "]", cleaned)
-
-    # 🔥 VERY IMPORTANT: escape quotes inside values
-    cleaned = re.sub(r'(?<=: ")(.*?)(?="[,}])',
-                     lambda m: m.group(0).replace('"', '\\"'),
-                     cleaned)
-
-    # Remove newlines inside strings
-    cleaned = cleaned.replace("\n", " ")
-
-    # Remove control chars
-    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", cleaned)
-
-    return json.loads(cleaned)
-
-# 🧠 Generate MCQs using Groq LLM
+# =========================
+# 12. HELPER — GENERATE MCQs FROM LLM
+# =========================
 def generate_mcqs_from_llm(content: str, num_questions: int, difficulty: str) -> list:
+    """
+    Call Groq LLM to generate MCQs.  Returns a list of valid question dicts.
+    Retries up to 3 times on parse failure.
+    """
     prompt = f"""
-Generate {num_questions} {difficulty} level MCQs from the following content:
+Generate exactly {num_questions} {difficulty}-level multiple-choice questions from the content below.
 
+CONTENT:
 {content}
 
-🎯 REQUIREMENTS:
-- Questions must NOT be repetitive or similar
-- Avoid basic definitions for all questions
-- Include a mix of:
-  • conceptual questions
-  • application-based questions
-  • tricky questions
-  • real-world scenarios (if possible)
+REQUIREMENTS:
+- No repetitive or definition-only questions
+- Mix of: conceptual, application, analytical, scenario-based questions
+- Each question must test understanding, not rote memorization
+- 4 distinct answer choices per question
+- All choices similar in length (avoid obvious length cues)
+- Distractors must be plausible — not obviously wrong
+- Correct answer must NOT follow a pattern (not always A)
+- Provide a clear explanation for the correct answer
 
-- Ensure variety across topics
-- Each question must test understanding, not memorization
-
-📌 OPTIONS RULES:
-- 4 options only
-- All options should be similar in length
-- Avoid obvious correct answers
-- Distractors must be realistic
-
-📌 ANSWER RULE:
-- Correct answer must NOT always be obvious
-- Avoid patterns like always "A" or short answer
-
-📌 OUTPUT FORMAT (STRICT JSON ONLY):
+OUTPUT FORMAT — respond with ONLY a valid JSON array, no markdown, no preamble:
 [
   {{
-    "question": "...",
-    "options": ["...", "...", "...", "..."],
-    "answer": "A",
-    "explanation": "Clear explanation why correct"
+    "question": "Question text here?",
+    "options": ["Option text A", "Option text B", "Option text C", "Option text D"],
+    "answer": "B",
+    "explanation": "Explanation why B is correct."
   }}
 ]
 """
 
-    for attempt in range(3):
+    for attempt in range(1, 4):
         try:
+            logger.info(f"LLM call attempt {attempt} for {num_questions} {difficulty} questions.")
             response = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a JSON API. You output only valid JSON arrays, nothing else."
+                        "content": (
+                            "You are a JSON API. Output ONLY a valid JSON array "
+                            "with no markdown, no explanation, no preamble."
+                        ),
                     },
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": prompt},
                 ],
-                temperature=0.3  # lower = more predictable output
+                temperature=0.4,
+                max_tokens=4096,
             )
 
             raw = response.choices[0].message.content.strip()
+            parsed = safe_json_parse(raw)
 
-            # Strip markdown fences
-            raw = re.sub(r"```json\s*", "", raw)
-            raw = re.sub(r"```\s*", "", raw)
-            raw = raw.strip()
-
-            # Extract just the array portion
-            start = raw.find('[')
-            end   = raw.rfind(']') + 1
-            if start == -1 or end == 0:
-                print(f"Attempt {attempt+1}: No JSON array found")
+            if not isinstance(parsed, list) or len(parsed) == 0:
+                logger.warning(f"Attempt {attempt}: parsed result is empty or not a list.")
                 continue
 
-            raw = raw[start:end]
+            # Validate and normalise each question
+            valid = []
+            for q in parsed:
+                try:
+                    if not isinstance(q, dict):
+                        continue
+                    if not q.get("question") or not isinstance(q.get("options"), list):
+                        continue
+                    if len(q["options"]) != 4:
+                        continue
+                    q["answer"] = normalize_answer_key(str(q.get("answer", "")))
+                    valid.append(q)
+                except ValueError as ve:
+                    logger.warning(f"Skipping question — {ve}")
+                    continue
 
-            # Fix common LLM JSON mistakes
-            raw = re.sub(r",\s*}", "}", raw)   # trailing comma before }
-            raw = re.sub(r",\s*]", "]", raw)   # trailing comma before ]
-            raw = raw.replace("\n", " ")
-            raw = re.sub(r"[\x00-\x1f\x7f]", "", raw)
-
-            parsed = json.loads(raw)
-
-            if isinstance(parsed, list) and len(parsed) > 0:
-                return parsed
+            if valid:
+                logger.info(f"Attempt {attempt}: got {len(valid)} valid questions.")
+                return valid
 
         except json.JSONDecodeError as e:
-            print(f"Attempt {attempt+1} JSON error: {e}")
-            print(f"Raw was: {raw[:300]}")
-            continue
+            logger.warning(f"Attempt {attempt} JSON error: {e}")
         except Exception as e:
-            print(f"Attempt {attempt+1} error: {e}")
-            continue
+            logger.error(f"Attempt {attempt} unexpected error: {e}")
 
     return []
 
 
-# 🔥 Bias Correction — Balance answer distribution across A/B/C/D
+# =========================
+# 13. HELPER — SPLIT TEXT INTO CHUNKS
+# =========================
+def split_text(text: str, chunk_size: int = CHUNK_SIZE) -> list[str]:
+    """Split text into overlapping chunks to preserve context across boundaries."""
+    chunks = []
+    overlap = 200  # char overlap to preserve context at boundaries
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - overlap if end < len(text) else len(text)
+    return chunks
+
+
+# =========================
+# 14. HELPER — BIAS CORRECTION
+# =========================
 def rebalance_answers(mcqs: list) -> list:
+    """
+    Redistribute correct answers so A/B/C/D each appear ~equally.
+    Shuffles options array and updates the answer key accordingly.
+    """
     labels = ["A", "B", "C", "D"]
     n = len(mcqs)
 
-    # Create perfectly balanced distribution
-    base = n // 4
+    # Build balanced target distribution
+    base      = n // 4
     remainder = n % 4
-
     target_labels = []
     for i, label in enumerate(labels):
         count = base + (1 if i < remainder else 0)
         target_labels.extend([label] * count)
-
-    # Shuffle to avoid predictable ordering
     random.shuffle(target_labels)
 
+    rebalanced = []
     for i, q in enumerate(mcqs):
-        # Guard: ensure answer index is valid
-        answer_index = ord(q["answer"].upper()) - 65
-        if answer_index < 0 or answer_index > 3:
-            raise ValueError(f"Invalid answer '{q['answer']}' in question {i+1}")
+        try:
+            answer_index = ord(q["answer"]) - 65          # 'A'→0 … 'D'→3
+            if not (0 <= answer_index <= 3):
+                logger.warning(f"Q{i+1}: invalid answer index, skipping rebalance.")
+                rebalanced.append(q)
+                continue
 
-        correct_value = q["options"][answer_index]
+            correct_text = q["options"][answer_index]
 
-        # Shuffle all options randomly
-        random.shuffle(q["options"])
+            # Shuffle all options
+            opts = q["options"][:]
+            random.shuffle(opts)
 
-        # Determine target position for correct answer
-        target_label = target_labels[i]
-        target_index = ord(target_label) - 65
+            # Place correct answer at the target position
+            target_label = target_labels[i]
+            target_idx   = ord(target_label) - 65
 
-        # Remove correct answer from shuffled list and re-insert at target position
-        if correct_value in q["options"]:
-            q["options"].remove(correct_value)
-        q["options"].insert(target_index, correct_value)
+            if correct_text in opts:
+                opts.remove(correct_text)
+            opts.insert(target_idx, correct_text)
 
-        # Update the answer label to match new position
-        q["answer"] = target_label
+            q["options"] = opts
+            q["answer"]  = target_label
+            rebalanced.append(q)
 
-    return mcqs
+        except Exception as e:
+            logger.warning(f"Q{i+1} rebalance error: {e} — keeping original.")
+            rebalanced.append(q)
+
+    return rebalanced
 
 
-# 🔥 Normalize Option Lengths — Prevent correct answer from standing out by length
+# =========================
+# 15. HELPER — NORMALIZE OPTION LENGTHS
+# =========================
 def normalize_options(mcqs: list) -> list:
+    """Trim excessively long options to prevent length-based answer leaking."""
     for q in mcqs:
-        # Simply trim overly long options — do NOT pad with spaces (bad in JSON/UI)
-        q["options"] = [opt[:120].strip() for opt in q["options"]]
+        q["options"] = [opt.strip()[:150] for opt in q["options"]]
     return mcqs
 
 
-# 🙈 Hide answers for exam mode
+# =========================
+# 16. HELPER — HIDE ANSWERS (exam mode)
+# =========================
 def hide_answers(mcqs: list) -> list:
     return [
-        {
-            "question": q["question"],
-            "options": q["options"]
-        }
+        {"question": q["question"], "options": q["options"]}
         for q in mcqs
     ]
 
 
 # =========================
-# 6. ROUTES
+# 17. ROUTES
 # =========================
 
 @app.get("/")
 def home():
     return {
-        "message": "Bias-Free MCQ Assessment System is Running 🚀",
+        "message": "NeuralExam Bias-Free MCQ API is running 🚀",
+        "version": "2.0.0",
         "endpoints": {
             "generate": "POST /generate-mcq",
-            "submit": "POST /submit-answers"
-        }
+            "submit":   "POST /submit-answers",
+            "health":   "GET  /health",
+        },
+    }
+
+
+@app.get("/health")
+def health():
+    purge_expired_sessions()
+    return {
+        "status": "ok",
+        "active_sessions": len(stored_sessions),
     }
 
 
 # =========================
-# 7. GENERATE MCQ API
+# 18. GENERATE MCQ ENDPOINT
 # =========================
 @app.post("/generate-mcq")
 async def generate_mcq(
-    topic: str = Form(None),
-    text: str = Form(None),
-    file: UploadFile = File(None),
-    num_questions: int = Form(...),
-    difficulty: str = Form(...),
-    mode: str = Form("exam")  # "exam" or "practice"
+    topic:         str        = Form(None),
+    text:          str        = Form(None),
+    file:          UploadFile = File(None),
+    num_questions: int        = Form(...),
+    difficulty:    str        = Form(...),
+    mode:          str        = Form("exam"),
 ):
-    # --- Input Validation ---
-    if difficulty.lower() not in VALID_DIFFICULTIES:
-        return {"error": f"Invalid difficulty. Choose from: {', '.join(VALID_DIFFICULTIES)}"}
+    purge_expired_sessions()
 
-    if not (1 <= num_questions <= 50):
-        return {"error": "num_questions must be between 1 and 50."}
+    # --- Validate inputs ---
+    difficulty = difficulty.strip().lower()
+    mode       = mode.strip().lower()
 
-    if mode not in {"exam", "practice"}:
-        return {"error": "mode must be 'exam' or 'practice'."}
+    if difficulty not in VALID_DIFFICULTIES:
+        raise HTTPException(400, f"Invalid difficulty. Choose from: {', '.join(VALID_DIFFICULTIES)}")
 
-    try:
-        content = ""
+    if not (MIN_QUESTIONS <= num_questions <= MAX_QUESTIONS):
+        raise HTTPException(400, f"num_questions must be between {MIN_QUESTIONS} and {MAX_QUESTIONS}.")
 
-        # --- Input Source Handling ---
-        if topic:
-            content = topic.strip()
+    if mode not in VALID_MODES:
+        raise HTTPException(400, "mode must be 'exam' or 'practice'.")
 
-        elif text:
-            content = text.strip()
+    # --- Build content string ---
+    content = ""
 
-        elif file:
-            file_path = f"temp_{uuid.uuid4().hex}_{file.filename}"
-            try:
-                with open(file_path, "wb") as f:
-                    f.write(await file.read())
+    if topic and topic.strip():
+        content = topic.strip()
 
-                if file.filename.lower().endswith(".pdf"):
-                    content = extract_text_from_pdf(file_path)
-                else:
-                    return {"error": "Unsupported file type. Only PDF is supported."}
+    elif text and text.strip():
+        content = text.strip()
 
-            finally:
-                # FIX: Always clean up temp file to prevent disk/security leaks
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+    elif file:
+        # Sanitize filename — prevent path traversal
+        safe_name = re.sub(r"[^\w.\-]", "_", os.path.basename(file.filename or "upload"))
+        file_path = os.path.join(TEMP_DIR, f"mcq_{uuid.uuid4().hex}_{safe_name}")
 
-        else:
-            return {"error": "No input provided. Send a topic, text, or PDF file."}
+        try:
+            file_bytes = await file.read()
+            if len(file_bytes) > 10 * 1024 * 1024:   # 10 MB limit
+                raise HTTPException(400, "File too large. Maximum size is 10 MB.")
 
-        if not content.strip():
-            return {"error": "Extracted content is empty. Please provide valid input."}
+            with open(file_path, "wb") as f:
+                f.write(file_bytes)
 
-        # Limit content size to avoid LLM token overflow
-        def split_text(text, chunk_size=1000):
-            return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+            if not safe_name.lower().endswith(".pdf"):
+                raise HTTPException(400, "Unsupported file type. Only PDF is supported.")
 
-        # --- Generate & Process MCQs ---
-        # 🔥 Split large content into chunks
-        chunks = split_text(content, 1000)
-        all_mcqs = []
+            content = extract_text_from_pdf(file_path)
 
-# decide how many questions per chun
-        per_chunk = max(2, num_questions // min(len(chunks), 5))
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"File processing error: {e}")
+            raise HTTPException(500, f"Failed to process file: {e}")
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+    else:
+        raise HTTPException(400, "No input provided. Send a topic, text, or PDF file.")
 
-# limit chunks (avoid too many API calls)
-        chunks = chunks[:5]
+    if not content.strip():
+        raise HTTPException(400, "Extracted content is empty. Please provide valid input.")
 
-        for chunk in chunks:
-            part = generate_mcqs_from_llm(chunk, per_chunk, difficulty.lower())
-            if part:
-                all_mcqs.extend(part)
+    # --- Chunk content and generate MCQs ---
+    chunks   = split_text(content, CHUNK_SIZE)[:MAX_CHUNKS]
+    n_chunks = len(chunks)
 
-# final trim to requested number
-        mcqs = all_mcqs[:num_questions]
-        if not mcqs or len(mcqs) < 3:
-            return {"error": "AI failed to generate enough MCQs. Try smaller input."}
+    # Distribute questions evenly across chunks, ensuring total >= num_questions
+    base_per_chunk = max(3, (num_questions + n_chunks - 1) // n_chunks)
 
-        mcqs = [
-    q for q in mcqs
-    if isinstance(q, dict)
-    and "question" in q
-    and isinstance(q.get("options"), list)
-    and len(q["options"]) == 4
-    and q.get("answer") in ["A", "B", "C", "D"]
-]
+    all_mcqs: list = []
+    for idx, chunk in enumerate(chunks):
+        # Request slightly more per chunk to compensate for filtered-out bad questions
+        request_count = min(base_per_chunk + 2, 15)
+        logger.info(f"Chunk {idx+1}/{n_chunks}: requesting {request_count} questions.")
+        part = generate_mcqs_from_llm(chunk, request_count, difficulty)
+        if part:
+            all_mcqs.extend(part)
+        # Stop early if we already have enough
+        if len(all_mcqs) >= num_questions * 1.5:
+            break
 
-        if not mcqs or not isinstance(mcqs, list):
-            return {"error": "Failed to generate MCQs. Please try again."}
-        if len(mcqs) < num_questions // 2:
-            return {"error": "Too many invalid questions generated. Try again."}
+    # De-duplicate by question text (case-insensitive)
+    seen: set[str] = set()
+    unique_mcqs: list = []
+    for q in all_mcqs:
+        key = q["question"].strip().lower()[:80]
+        if key not in seen:
+            seen.add(key)
+            unique_mcqs.append(q)
 
-        # Apply bias correction and normalization
-        mcqs = rebalance_answers(mcqs)
-        mcqs = normalize_options(mcqs)
+    mcqs = unique_mcqs[:num_questions]
 
-        # FIX: Use session ID instead of global variable for thread safety
-        session_id = str(uuid.uuid4())
-        stored_sessions[session_id] = mcqs
+    # Validate minimum yield
+    if len(mcqs) < max(1, num_questions // 2):
+        raise HTTPException(
+            500,
+            f"AI only generated {len(mcqs)} valid questions (requested {num_questions}). "
+            "Try a longer text or a different topic."
+        )
 
-        # Return based on mode
-        if mode == "exam":
-            return {
-                "session_id": session_id,
-                "mode": "exam",
-                "total_questions": len(mcqs),
-                "mcqs": hide_answers(mcqs)
-            }
+    # --- Apply bias corrections ---
+    mcqs = rebalance_answers(mcqs)
+    mcqs = normalize_options(mcqs)
 
-        return {
-            "session_id": session_id,
-            "mode": "practice",
-            "total_questions": len(mcqs),
-            "mcqs": mcqs
-        }
+    # --- Store session ---
+    session_id = str(uuid.uuid4())
+    stored_sessions[session_id] = {
+        "mcqs":       mcqs,
+        "created_at": time.time(),
+        "mode":       mode,
+    }
+    logger.info(f"Session {session_id} created with {len(mcqs)} questions.")
 
-    except ValueError as ve:
-        return {"error": f"Validation error: {str(ve)}"}
-    except Exception as e:
-        return {"error": f"Unexpected error: {str(e)}"}
+    # --- Return response ---
+    response_mcqs = hide_answers(mcqs) if mode == "exam" else mcqs
+
+    return {
+        "session_id":      session_id,
+        "mode":            mode,
+        "total_questions": len(mcqs),
+        "mcqs":            response_mcqs,
+    }
 
 
 # =========================
-# 8. SUBMIT ANSWERS API
+# 19. SUBMIT ANSWERS ENDPOINT
 # =========================
 @app.post("/submit-answers")
 def submit_answers(request: SubmitRequest):
-    # FIX: Fetch MCQs using session_id (thread-safe, multi-user safe)
-    mcqs = stored_sessions.get(request.session_id)
+    purge_expired_sessions()
 
-    if not mcqs:
-        return {"error": "Session not found or expired. Please generate MCQs first."}
+    session = stored_sessions.get(request.session_id)
+    if not session:
+        raise HTTPException(404, "Session not found or expired. Please generate MCQs first.")
+
+    mcqs = session["mcqs"]
 
     if len(request.answers) != len(mcqs):
-        return {
-            "error": f"Answer count mismatch. Expected {len(mcqs)}, got {len(request.answers)}."
-        }
+        raise HTTPException(
+            400,
+            f"Answer count mismatch. Expected {len(mcqs)}, got {len(request.answers)}."
+        )
 
-    score = 0
+    score  = 0
     result = []
 
     for i, q in enumerate(mcqs):
-        correct = q["answer"].upper()
-        user = request.answers[i].strip().upper()
+        raw_user = request.answers[i].strip().upper()
 
-        # Validate each answer input
-        if user not in ["A", "B", "C", "D"]:
-            return {"error": f"Invalid answer '{request.answers[i]}' at question {i+1}. Use A, B, C, or D."}
+        # Validate answer format
+        if raw_user not in ["A", "B", "C", "D"]:
+            raise HTTPException(
+                400,
+                f"Invalid answer '{request.answers[i]}' at question {i+1}. Use A, B, C, or D."
+            )
 
-        is_correct = user == correct
+        correct    = q["answer"].upper()
+        is_correct = raw_user == correct
         if is_correct:
             score += 1
 
         result.append({
-            "question_no": i + 1,
-            "question": q["question"],
-            "your_answer": user,
-            "correct_answer": correct,
-            "is_correct": is_correct,
-            "explanation": q.get("explanation", "No explanation provided.")
+            "question_no":     i + 1,
+            "question":        q["question"],
+            "your_answer":     raw_user,
+            "correct_answer":  correct,
+            "is_correct":      is_correct,
+            "explanation":     q.get("explanation", "No explanation provided."),
         })
 
-    percentage = round((score / len(mcqs)) * 100, 2)
+    total      = len(mcqs)
+    percentage = round((score / total) * 100, 2)
 
-    # Optional: grade label
-    if percentage >= 90:
-        grade = "Excellent 🏆"
-    elif percentage >= 75:
-        grade = "Good 👍"
-    elif percentage >= 50:
-        grade = "Average 📘"
-    else:
-        grade = "Needs Improvement 📝"
+    if   percentage >= 90: grade = "Excellent 🏆"
+    elif percentage >= 75: grade = "Good 👍"
+    elif percentage >= 50: grade = "Average 📘"
+    else:                  grade = "Needs Improvement 📝"
 
-    # Clean up session after submission to free memory
+    # Clean up session after grading
     del stored_sessions[request.session_id]
+    logger.info(f"Session {request.session_id} graded and removed. Score: {score}/{total}")
 
     return {
-        "score": score,
-        "total": len(mcqs),
+        "score":      score,
+        "total":      total,
         "percentage": percentage,
-        "grade": grade,
-        "result": result
+        "grade":      grade,
+        "result":     result,
     }
-
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
